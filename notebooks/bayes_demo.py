@@ -11,6 +11,7 @@
 #     "pytest>=9.0.2",
 #     "pyzmq>=27.1.0",
 #     "scikit-misc>=0.5.2",
+#     "skforecast>=0.19.1",
 # ]
 # requires-python = ">=3.13"
 # ///
@@ -28,6 +29,9 @@ with app.setup:
     import plotnine as p9
     from mizani.breaks import breaks_date_width
     from mizani.labels import label_date
+
+    from skforecast.recursive import ForecasterRecursiveMultiSeries
+    from skforecast.preprocessing import RollingFeatures
 
     import matplotlib.style
 
@@ -143,46 +147,11 @@ def _():
         n_articles_per_category=5,
         n_categories=12,
         rng=rng,
+        n_lags=0
     )
 
     df_sales
     return (df_sales,)
-
-
-@app.cell
-def _(df_sales):
-    df_sales_grouped = (
-        df_sales
-        .sort_values("date")
-        .groupby(["category", "article"])
-    )
-
-    split_size = 0.8
-
-    df_sales_train = (
-        df_sales_grouped
-        .apply(lambda df: df.iloc[:int(len(df) * split_size)])
-        .reset_index()
-    )
-
-    df_sales_test = (
-        df_sales_grouped
-        .apply(lambda df: df.iloc[int(len(df) * split_size):])
-        .reset_index()
-    )
-
-    X_train, y_train = (
-        df_sales_train
-        .filter(regex="^sales_t-"),
-        df_sales_train["sales"]
-    )
-
-    X_test, y_test = (
-        df_sales_test
-        .filter(regex="^sales_t-"),
-        df_sales_test["sales"]
-    )
-    return X_test, X_train, df_sales_test, df_sales_train, y_train
 
 
 @app.cell
@@ -231,98 +200,100 @@ def _(df_sales):
 
 
 @app.cell
-def _(X_train, y_train):
-    import lightgbm as lgb
+def _(df_sales):
+    split_date = "2024-01-20"
 
-    model = lgb.LGBMRegressor(
-        n_estimators=100,
-        random_state=123,
+    df_sales_date_index = df_sales.pivot(
+        index="date", 
+        columns="article",
+        values="sales",
+    ).rename(columns=lambda col: f"article_{col}").asfreq("D")
+
+
+    df_sales_train = df_sales_date_index.query("date < @split_date")
+    df_sales_test = df_sales_date_index.query("date >= @split_date")
+
+    df_sales_train
+    return (df_sales_train,)
+
+
+@app.cell
+def _(df_sales_train):
+    from lightgbm import LGBMRegressor
+    window_features = RollingFeatures(
+        stats=["mean", "std", "min", "max"],
+        window_sizes=7,
     )
 
-    model.fit(X_train, y_train)
-
-    return (model,)
-
-
-@app.cell
-def _(X_test, df_sales_test, model):
-    df_sales_test_pred = (
-        df_sales_test
-        .assign(
-            sales_pred=model.predict(X_test),
-        )
+    forecaster = ForecasterRecursiveMultiSeries(
+        LGBMRegressor(verbose=-1),
+        lags=5,
+        window_features=window_features,
     )
 
-    df_sales_test_pred
-    return (df_sales_test_pred,)
+    forecaster.fit(
+        series=df_sales_train,
+    )
+    return (forecaster,)
 
 
 @app.cell
-def _(df_sales_test_pred, df_sales_train):
-    df_plot_pred = pd.concat([
-        df_sales_train.assign(
-            sales_pred=None
-        ), 
-        df_sales_test_pred
-    ])
-    return (df_plot_pred,)
-
-
-@app.cell
-def _(df_sales_test):
-    df_sales_test
+def _(forecaster):
+    forecaster.predict(
+        steps=11,
+    ).reset_index(names="date")
     return
 
 
 @app.cell
-def _(df_plot_pred):
-    random_articles = rng.choice(
-        df_plot_pred["article"].unique(),
-        size=3,
-        replace=False,
-    )
-
+def _(df_sales, forecaster):
     (
-        df_plot_pred
-        .query("article.isin(@random_articles)")
+        df_sales
+        .merge(
+            forecaster.predict(steps=12).assign(
+                article=lambda df: df["level"].str.replace("article_", "").astype("int64")
+            ).reset_index(names="date"),
+            on=["date", "article"],
+            how="left"
+        )
         .melt(
             id_vars=["date", "category", "article"],
-            value_vars=["sales", "sales_pred"],
+            value_vars=["sales", "pred"],
             var_name="type",
-            value_name="n_sales",
         )
-        .rename(columns={"n_sales": "sales"})
+        .rename(columns={"value": "sales"})
+        .query("article.isin([0, 1, 2])")
         >>
         p9.ggplot(
             mapping=p9.aes(
                 x="date",
                 y="sales",
-                group="type",
                 color="type",
-                fill="type",
-                linetype="type"
+                linetype="type",
             )
         )
         + p9.geom_line()
-        + p9.scale_x_datetime(
-            breaks=breaks_date_width("7 day"),
-            labels=label_date("%d")
-        )
         + p9.facet_wrap(
             "article",
             labeller="label_both",
         )
+        + p9.scale_x_datetime(
+            breaks=breaks_date_width("7 day"),
+            labels=label_date("%d")
+        )
+        + p9.scale_color_manual(
+            values=["red", "black"],
+            labels=["predicted", "actual"],
+        )
+        + p9.scale_linetype_manual(
+            values=["dashed", "solid"],
+            labels=["predicted", "actual"],
+        )
         + p9.theme_minimal()
         + p9.theme(
-            figure_size=(7, 3),
-            legend_position="bottom",
-            axis_text_x=p9.element_text(
-                rotation=90,
-                vjust=0.5,
-                hjust=1,
-            )
+            figure_size=(7, 5),
+            legend_position="top",
         )
-        + p9.coord_cartesian(ylim=(0, None))
     )
     return
 
